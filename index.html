@@ -12,13 +12,19 @@
   .msg { position:absolute; bottom:24px; left:0; right:0; text-align:center; color:#fff; font-size:14px; padding:0 16px; }
   .errorBox { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:24px; gap:12px; }
   .errorBox button { padding:10px 24px; border-radius:8px; border:none; background:#1A73E8; color:#fff; font-size:15px; }
+  .startBox { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:24px; gap:16px; }
+  .startBox button { padding:18px 36px; border-radius:10px; border:none; background:#1A73E8; color:#fff; font-size:18px; font-weight:600; }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <video id="video" autoplay playsinline muted></video>
-  <div class="frame"></div>
-  <div class="msg">QRコードを枠内に収めてください</div>
+  <video id="video" autoplay playsinline muted style="display:none;"></video>
+  <div class="frame" id="frame" style="display:none;"></div>
+  <div class="msg" id="scanMsg" style="display:none;">QRコードを枠内に収めてください</div>
+  <div class="startBox" id="startBox">
+    <div>タップしてカメラを起動してください</div>
+    <button id="startCameraBtn" type="button">カメラを起動</button>
+  </div>
   <div class="errorBox" id="errorBox">
     <div id="errorText">カメラを起動できませんでした</div>
     <button onclick="window.close()">閉じる</button>
@@ -48,8 +54,12 @@ function sendResultAndClose(qrId) {
 }
 
 function showError(message) {
+  document.getElementById('startBox').style.display = 'none';
   document.getElementById('errorText').textContent = message;
   document.getElementById('errorBox').style.display = 'flex';
+  if (window.opener) {
+    window.opener.postMessage({ type: 'qr-error', message: message }, '*');
+  }
 }
 
 function tick(stream) {
@@ -70,18 +80,24 @@ function tick(stream) {
   requestAnimationFrame(function () { tick(stream); });
 }
 
-if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-  showError('このブラウザはカメラに対応していません');
-} else {
+document.getElementById('startCameraBtn').addEventListener('click', function () {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showError('このブラウザはカメラに対応していません');
+    return;
+  }
   navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
     .then(function (stream) {
+      document.getElementById('startBox').style.display = 'none';
+      video.style.display = '';
+      document.getElementById('frame').style.display = '';
+      document.getElementById('scanMsg').style.display = '';
       video.srcObject = stream;
       requestAnimationFrame(function () { tick(stream); });
     })
     .catch(function (err) {
       showError('カメラを起動できませんでした: ' + (err && err.name ? err.name : 'Error'));
     });
-}
+});
 </script>
 </body>
 </html>
