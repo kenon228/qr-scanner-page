@@ -45,10 +45,23 @@ var video = document.getElementById('video');
 var canvas = document.getElementById('canvas');
 var ctx = canvas.getContext('2d');
 var detected = false;
+var query = new URLSearchParams(window.location.search);
+var scanNonce = query.get('nonce') || '';
+var openerOrigin = query.get('openerOrigin') || '';
+
+function hasValidLaunchParameters() {
+  if (!/^[a-f0-9]{32}$/.test(scanNonce)) return false;
+  try {
+    var parsed = new URL(openerOrigin);
+    return parsed.protocol === 'https:' && parsed.origin === openerOrigin;
+  } catch (e) {
+    return false;
+  }
+}
 
 function sendResultAndClose(qrId) {
-  if (window.opener) {
-    window.opener.postMessage({ type: 'qr-scanned', qrId: qrId }, '*');
+  if (window.opener && hasValidLaunchParameters()) {
+    window.opener.postMessage({ type: 'qr-scanned', qrId: qrId, nonce: scanNonce }, openerOrigin);
   }
   window.close();
 }
@@ -57,8 +70,8 @@ function showError(message) {
   document.getElementById('startBox').style.display = 'none';
   document.getElementById('errorText').textContent = message;
   document.getElementById('errorBox').style.display = 'flex';
-  if (window.opener) {
-    window.opener.postMessage({ type: 'qr-error', message: message }, '*');
+  if (window.opener && hasValidLaunchParameters()) {
+    window.opener.postMessage({ type: 'qr-error', message: message, nonce: scanNonce }, openerOrigin);
   }
 }
 
@@ -81,6 +94,10 @@ function tick(stream) {
 }
 
 document.getElementById('startCameraBtn').addEventListener('click', function () {
+  if (!window.opener || !hasValidLaunchParameters()) {
+    showError('試薬管理アプリからQRスキャンを開始してください');
+    return;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     showError('このブラウザはカメラに対応していません');
     return;
