@@ -2,18 +2,19 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QRスキャン</title>
 <style>
   body { margin:0; background:#000; font-family:-apple-system,"Segoe UI","Hiragino Sans",sans-serif; }
-  #wrap { position:relative; width:100%; height:100vh; display:flex; align-items:center; justify-content:center; }
+  #wrap { position:relative; width:100%; height:100vh; height:100dvh; display:flex; align-items:center; justify-content:center; }
   video { width:100%; height:100%; object-fit:cover; }
   .frame { position:absolute; width:70vw; max-width:320px; height:70vw; max-height:320px; border:3px solid #fff; border-radius:12px; box-shadow:0 0 0 9999px rgba(0,0,0,.4); }
-  .msg { position:absolute; bottom:24px; left:0; right:0; text-align:center; color:#fff; font-size:14px; padding:0 16px; }
-  .errorBox { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:24px; gap:12px; }
-  .errorBox button { padding:10px 24px; border-radius:8px; border:none; background:#1A73E8; color:#fff; font-size:15px; }
-  .startBox { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:24px; gap:16px; }
-  .startBox button { padding:18px 36px; border-radius:10px; border:none; background:#1A73E8; color:#fff; font-size:18px; font-weight:600; }
+  .msg { position:absolute; bottom:calc(24px + env(safe-area-inset-bottom)); left:0; right:0; text-align:center; color:#fff; font-size:14px; padding:0 16px; }
+  .errorBox { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom)); gap:12px; }
+  .errorBox button { min-height:44px; padding:10px 24px; border-radius:8px; border:none; background:#1A73E8; color:#fff; font-size:15px; }
+  .startBox { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom)); gap:16px; }
+  .startBox button { min-height:52px; padding:14px 36px; border-radius:10px; border:none; background:#1A73E8; color:#fff; font-size:18px; font-weight:600; }
+  button:disabled { opacity:.65; }
 </style>
 </head>
 <body>
@@ -45,6 +46,10 @@ var video = document.getElementById('video');
 var canvas = document.getElementById('canvas');
 var ctx = canvas.getContext('2d');
 var detected = false;
+var starting = false;
+var activeStream = null;
+var lastAnalysisAt = 0;
+var pageLeaving = false;
 var query = new URLSearchParams(window.location.search);
 var scanNonce = query.get('nonce') || '';
 var openerOrigin = query.get('openerOrigin') || '';
@@ -60,13 +65,21 @@ function hasValidLaunchParameters() {
 }
 
 function sendResultAndClose(qrId) {
+  stopCamera();
   if (window.opener && hasValidLaunchParameters()) {
     window.opener.postMessage({ type: 'qr-scanned', qrId: qrId, nonce: scanNonce }, openerOrigin);
   }
   window.close();
 }
 
+function stopCamera() {
+  if (activeStream) activeStream.getTracks().forEach(function (track) { track.stop(); });
+  activeStream = null;
+  video.srcObject = null;
+}
+
 function showError(message) {
+  stopCamera();
   document.getElementById('startBox').style.display = 'none';
   document.getElementById('errorText').textContent = message;
   document.getElementById('errorBox').style.display = 'flex';
@@ -75,25 +88,28 @@ function showError(message) {
   }
 }
 
-function tick(stream) {
-  if (detected) return;
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+function tick(timestamp) {
+  if (detected || !activeStream) return;
+  if (timestamp - lastAnalysisAt >= 120 && video.readyState === video.HAVE_ENOUGH_DATA) {
+    lastAnalysisAt = timestamp;
+    var analysisWidth = Math.min(800, video.videoWidth);
+    var scale = analysisWidth / video.videoWidth;
+    canvas.width = analysisWidth;
+    canvas.height = Math.round(video.videoHeight * scale);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     var imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     var code = jsQR(imageData.data, imageData.width, imageData.height);
     if (code && code.data) {
       detected = true;
-      stream.getTracks().forEach(function (t) { t.stop(); });
       sendResultAndClose(code.data);
       return;
     }
   }
-  requestAnimationFrame(function () { tick(stream); });
+  requestAnimationFrame(tick);
 }
 
 document.getElementById('startCameraBtn').addEventListener('click', function () {
+  if (starting || activeStream) return;
   if (!window.opener || !hasValidLaunchParameters()) {
     showError('試薬管理アプリからQRスキャンを開始してください');
     return;
@@ -102,18 +118,32 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
     showError('このブラウザはカメラに対応していません');
     return;
   }
+  starting = true;
+  this.disabled = true;
+  this.textContent = '起動中…';
   navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
     .then(function (stream) {
+      if (pageLeaving) {
+        stream.getTracks().forEach(function (track) { track.stop(); });
+        return;
+      }
+      activeStream = stream;
+      starting = false;
       document.getElementById('startBox').style.display = 'none';
       video.style.display = '';
       document.getElementById('frame').style.display = '';
       document.getElementById('scanMsg').style.display = '';
       video.srcObject = stream;
-      requestAnimationFrame(function () { tick(stream); });
+      requestAnimationFrame(tick);
     })
     .catch(function (err) {
+      starting = false;
       showError('カメラを起動できませんでした: ' + (err && err.name ? err.name : 'Error'));
     });
+});
+window.addEventListener('pagehide', function () {
+  pageLeaving = true;
+  stopCamera();
 });
 </script>
 </body>
