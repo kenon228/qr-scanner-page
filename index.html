@@ -15,6 +15,11 @@
   .startBox { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; text-align:center; padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom)); gap:16px; }
   .startBox button { min-height:52px; padding:14px 36px; border-radius:10px; border:none; background:#1A73E8; color:#fff; font-size:18px; font-weight:600; }
   button:disabled { opacity:.65; }
+  .auditBox { position:absolute; top:calc(12px + env(safe-area-inset-top)); left:12px; right:12px;
+    display:none; z-index:4; background:rgba(0,0,0,.72); color:#fff; border-radius:10px;
+    padding:12px; text-align:center; }
+  .auditBox button { min-height:44px; margin:8px 4px 0; padding:8px 18px; border:0; border-radius:8px;
+    background:#1A73E8; color:#fff; font-size:15px; }
 </style>
 </head>
 <body>
@@ -29,6 +34,11 @@
   <div class="errorBox" id="errorBox">
     <div id="errorText">カメラを起動できませんでした</div>
     <button onclick="window.close()">閉じる</button>
+  </div>
+  <div class="auditBox" id="auditBox" role="status" aria-live="polite">
+    <div id="auditStatus">棚卸し連続スキャン</div>
+    <button id="auditResumeBtn" type="button" style="display:none;">次の読取へ</button>
+    <button id="auditCloseBtn" type="button">終了</button>
   </div>
 </div>
 <canvas id="canvas" style="display:none;"></canvas>
@@ -53,9 +63,17 @@ var pageLeaving = false;
 var query = new URLSearchParams(window.location.search);
 var scanNonce = query.get('nonce') || '';
 var openerOrigin = query.get('openerOrigin') || '';
+var scanMode = query.get('mode') || 'single';
+var auditSessionId = query.get('sessionId') || '';
+var auditWaitingAck = false;
+var auditAckTimer = null;
+var auditMessageId = '';
+var lastSentQr = '';
+var blankSince = 0;
 
 function hasValidLaunchParameters() {
   if (!/^[a-f0-9]{32}$/.test(scanNonce)) return false;
+  if (scanMode === 'audit' && !/^[a-f0-9]{32}$/.test(auditSessionId)) return false;
   try {
     var parsed = new URL(openerOrigin);
     return parsed.protocol === 'https:' && parsed.origin === openerOrigin;
@@ -65,11 +83,50 @@ function hasValidLaunchParameters() {
 }
 
 function sendResultAndClose(qrId) {
+  if (scanMode === 'audit') {
+    sendAuditCandidate(qrId);
+    return;
+  }
   stopCamera();
   if (window.opener && hasValidLaunchParameters()) {
     window.opener.postMessage({ type: 'qr-scanned', qrId: qrId, nonce: scanNonce }, openerOrigin);
   }
   window.close();
+}
+
+function setAuditStatus(message, canResume) {
+  document.getElementById('auditBox').style.display = 'block';
+  document.getElementById('auditStatus').textContent = message;
+  document.getElementById('auditResumeBtn').style.display = canResume ? '' : 'none';
+}
+
+function newMessageId() {
+  var bytes = new Uint8Array(12);
+  window.crypto.getRandomValues(bytes);
+  return Array.prototype.map.call(bytes, function (value) {
+    return ('0' + value.toString(16)).slice(-2);
+  }).join('');
+}
+
+function sendAuditCandidate(qrId) {
+  if (auditWaitingAck || !window.opener || !hasValidLaunchParameters()) return;
+  auditWaitingAck = true;
+  detected = true;
+  lastSentQr = String(qrId || '').trim();
+  auditMessageId = newMessageId();
+  setAuditStatus('保存確認中… ' + lastSentQr, false);
+  window.opener.postMessage({
+    type: 'audit-qr-candidate',
+    qrId: lastSentQr,
+    messageId: auditMessageId,
+    nonce: scanNonce,
+    sessionId: auditSessionId
+  }, openerOrigin);
+  clearTimeout(auditAckTimer);
+  auditAckTimer = setTimeout(function () {
+    auditWaitingAck = false;
+    setAuditStatus('保存結果を確認できませんでした。アプリ画面を確認してください', true);
+  }, 45000);
 }
 
 function stopCamera() {
@@ -88,6 +145,25 @@ function showError(message) {
   }
 }
 
+window.addEventListener('message', function (event) {
+  if (scanMode !== 'audit' || event.origin !== openerOrigin || event.source !== window.opener) return;
+  var data = event.data || {};
+  if (data.type !== 'audit-scan-ack' || data.nonce !== scanNonce ||
+      data.sessionId !== auditSessionId || data.messageId !== auditMessageId) return;
+  clearTimeout(auditAckTimer);
+  auditWaitingAck = false;
+  var normal = data.ok && ['CONFIRMED', 'DUPLICATE_SAME_LOCATION', 'MANUAL_IDENTIFIED'].indexOf(data.result) !== -1;
+  var pending = data.result === 'PENDING';
+  if (navigator.vibrate) navigator.vibrate(normal ? 70 : [120, 80, 120]);
+  setAuditStatus((data.ok ? '保存済み: ' : pending ? '確認待ち: ' : '保存失敗: ') +
+    (data.message || data.result || ''), !normal && !pending);
+  if (normal) {
+    blankSince = 0;
+    detected = false;
+    requestAnimationFrame(tick);
+  }
+});
+
 function tick(timestamp) {
   if (detected || !activeStream) return;
   if (timestamp - lastAnalysisAt >= 120 && video.readyState === video.HAVE_ENOUGH_DATA) {
@@ -100,9 +176,23 @@ function tick(timestamp) {
     var imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     var code = jsQR(imageData.data, imageData.width, imageData.height);
     if (code && code.data) {
+      if (scanMode === 'audit' && lastSentQr && String(code.data).trim() === lastSentQr) {
+        blankSince = 0;
+        requestAnimationFrame(tick);
+        return;
+      } else {
+        lastSentQr = '';
+      }
       detected = true;
       sendResultAndClose(code.data);
       return;
+    } else if (scanMode === 'audit' && lastSentQr && !auditWaitingAck) {
+      if (!blankSince) blankSince = timestamp;
+      if (timestamp - blankSince > 500) {
+        lastSentQr = '';
+        blankSince = 0;
+        setAuditStatus('次のQRを読み取ってください', false);
+      }
     }
   }
   requestAnimationFrame(tick);
@@ -133,6 +223,7 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
       video.style.display = '';
       document.getElementById('frame').style.display = '';
       document.getElementById('scanMsg').style.display = '';
+      if (scanMode === 'audit') setAuditStatus('次のQRを読み取ってください', false);
       video.srcObject = stream;
       requestAnimationFrame(tick);
     })
@@ -140,6 +231,19 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
       starting = false;
       showError('カメラを起動できませんでした: ' + (err && err.name ? err.name : 'Error'));
     });
+});
+document.getElementById('auditResumeBtn').addEventListener('click', function () {
+  auditWaitingAck = false;
+  detected = false;
+  lastSentQr = '';
+  blankSince = 0;
+  setAuditStatus('次のQRを読み取ってください', false);
+  requestAnimationFrame(tick);
+});
+document.getElementById('auditCloseBtn').addEventListener('click', function () {
+  pageLeaving = true;
+  stopCamera();
+  window.close();
 });
 window.addEventListener('pagehide', function () {
   pageLeaving = true;
