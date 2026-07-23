@@ -114,7 +114,8 @@ function sendAuditCandidate(qrId) {
   detected = true;
   lastSentQr = String(qrId || '').trim();
   auditMessageId = newMessageId();
-  setAuditStatus('保存確認中… ' + lastSentQr, false);
+  if (navigator.vibrate) navigator.vibrate(25);
+  setAuditStatus('QRを検出しました。保存中… ' + lastSentQr, false);
   window.opener.postMessage({
     type: 'audit-qr-candidate',
     qrId: lastSentQr,
@@ -124,8 +125,7 @@ function sendAuditCandidate(qrId) {
   }, openerOrigin);
   clearTimeout(auditAckTimer);
   auditAckTimer = setTimeout(function () {
-    auditWaitingAck = false;
-    setAuditStatus('保存結果を確認できませんでした。アプリ画面を確認してください', true);
+    setAuditStatus('保存確認に時間がかかっています。アプリ画面に戻って確認してください', false);
   }, 45000);
 }
 
@@ -150,13 +150,25 @@ window.addEventListener('message', function (event) {
   var data = event.data || {};
   if (data.type !== 'audit-scan-ack' || data.nonce !== scanNonce ||
       data.sessionId !== auditSessionId || data.messageId !== auditMessageId) return;
+  if (data.phase === 'RECEIVED') {
+    clearTimeout(auditAckTimer);
+    setAuditStatus(data.message || 'QRを検出しました。保存中…', false);
+    auditAckTimer = setTimeout(function () {
+      setAuditStatus('保存確認に時間がかかっています。アプリ画面に戻って確認してください', false);
+    }, 45000);
+    return;
+  }
+  if (data.phase === 'PENDING') {
+    clearTimeout(auditAckTimer);
+    setAuditStatus(data.message || '保存確認中です。アプリ画面に戻って確認してください', false);
+    return;
+  }
   clearTimeout(auditAckTimer);
   auditWaitingAck = false;
   var normal = data.ok && ['CONFIRMED', 'DUPLICATE_SAME_LOCATION', 'MANUAL_IDENTIFIED'].indexOf(data.result) !== -1;
-  var pending = data.result === 'PENDING';
-  if (navigator.vibrate) navigator.vibrate(normal ? 70 : [120, 80, 120]);
-  setAuditStatus((data.ok ? '保存済み: ' : pending ? '確認待ち: ' : '保存失敗: ') +
-    (data.message || data.result || ''), !normal && !pending);
+  if (navigator.vibrate) navigator.vibrate(normal ? [80, 60, 80] : [180]);
+  setAuditStatus((normal ? '保存済み: ' : data.ok ? '要確認として記録: ' : '保存失敗: ') +
+    (data.message || data.result || ''), !normal);
   if (normal) {
     blankSince = 0;
     detected = false;
