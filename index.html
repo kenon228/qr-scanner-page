@@ -67,7 +67,10 @@ var scanMode = query.get('mode') || 'single';
 var auditSessionId = query.get('sessionId') || '';
 var auditWaitingAck = false;
 var auditAckTimer = null;
+var auditLongWaitTimer = null;
 var auditMessageId = '';
+var auditDetectedAtEpochMs = 0;
+var auditResumeAction = 'resume';
 var lastSentQr = '';
 var blankSince = 0;
 
@@ -94,10 +97,55 @@ function sendResultAndClose(qrId) {
   window.close();
 }
 
-function setAuditStatus(message, canResume) {
+function setAuditStatus(message, canResume, resumeAction) {
   document.getElementById('auditBox').style.display = 'block';
   document.getElementById('auditStatus').textContent = message;
-  document.getElementById('auditResumeBtn').style.display = canResume ? '' : 'none';
+  var resumeBtn = document.getElementById('auditResumeBtn');
+  auditResumeAction = resumeAction || 'resume';
+  resumeBtn.textContent = auditResumeAction === 'check-app' ? 'アプリで確認' : '次の読み取りへ';
+  resumeBtn.style.display = canResume ? '' : 'none';
+}
+
+function setAuditProgressStatus(message) {
+  document.getElementById('auditBox').style.display = 'block';
+  document.getElementById('auditStatus').textContent = auditResumeAction === 'check-app'
+    ? '保存確認を続けています。必要ならアプリで確認してください。'
+    : message;
+}
+
+function isOpenerUnavailable() {
+  try {
+    return !window.opener || window.opener.closed;
+  } catch (e) {
+    return true;
+  }
+}
+
+function clearAuditWaitTimers() {
+  clearTimeout(auditAckTimer);
+  clearTimeout(auditLongWaitTimer);
+  auditAckTimer = null;
+  auditLongWaitTimer = null;
+}
+
+function scheduleAuditWaitNotices() {
+  clearAuditWaitTimers();
+  var elapsed = Math.max(0, Date.now() - auditDetectedAtEpochMs);
+  auditAckTimer = setTimeout(function () {
+    if (!auditWaitingAck) return;
+    if (isOpenerUnavailable()) {
+      setAuditStatus('アプリ画面との接続を確認できません。アプリ側で保存結果を確認してください。', true, 'check-app');
+      return;
+    }
+    setAuditStatus('保存処理が続いています。そのままお待ちください。', false);
+  }, Math.max(0, 45000 - elapsed));
+  auditLongWaitTimer = setTimeout(function () {
+    if (!auditWaitingAck) return;
+    var message = isOpenerUnavailable()
+      ? 'アプリ画面との接続を確認できません。アプリ側で保存結果を確認してください。'
+      : '保存確認に時間がかかっています。アプリ側で保存結果を確認できます。';
+    setAuditStatus(message, true, 'check-app');
+  }, Math.max(0, 180000 - elapsed));
 }
 
 function newMessageId() {
@@ -109,11 +157,17 @@ function newMessageId() {
 }
 
 function sendAuditCandidate(qrId) {
-  if (auditWaitingAck || !window.opener || !hasValidLaunchParameters()) return;
+  if (auditWaitingAck) return;
+  if (isOpenerUnavailable()) {
+    setAuditStatus('アプリ画面との接続を確認できません。アプリ側で保存結果を確認してください。', true, 'check-app');
+    return;
+  }
+  if (!hasValidLaunchParameters()) return;
   auditWaitingAck = true;
   detected = true;
   lastSentQr = String(qrId || '').trim();
   auditMessageId = newMessageId();
+  auditDetectedAtEpochMs = Date.now();
   if (navigator.vibrate) navigator.vibrate(25);
   setAuditStatus('QRを検出しました。保存中… ' + lastSentQr, false);
   window.opener.postMessage({
@@ -121,12 +175,10 @@ function sendAuditCandidate(qrId) {
     qrId: lastSentQr,
     messageId: auditMessageId,
     nonce: scanNonce,
-    sessionId: auditSessionId
+    sessionId: auditSessionId,
+    detectedAtEpochMs: auditDetectedAtEpochMs
   }, openerOrigin);
-  clearTimeout(auditAckTimer);
-  auditAckTimer = setTimeout(function () {
-    setAuditStatus('保存確認に時間がかかっています。アプリ画面に戻って確認してください', false);
-  }, 45000);
+  scheduleAuditWaitNotices();
 }
 
 function stopCamera() {
@@ -150,20 +202,22 @@ window.addEventListener('message', function (event) {
   var data = event.data || {};
   if (data.type !== 'audit-scan-ack' || data.nonce !== scanNonce ||
       data.sessionId !== auditSessionId || data.messageId !== auditMessageId) return;
+  if (data.phase === 'PROGRESS') {
+    setAuditProgressStatus(data.message || '保存処理が続いています。そのままお待ちください。');
+    return;
+  }
   if (data.phase === 'RECEIVED') {
-    clearTimeout(auditAckTimer);
     setAuditStatus(data.message || 'QRを検出しました。保存中…', false);
-    auditAckTimer = setTimeout(function () {
-      setAuditStatus('保存確認に時間がかかっています。アプリ画面に戻って確認してください', false);
-    }, 45000);
+    scheduleAuditWaitNotices();
     return;
   }
   if (data.phase === 'PENDING') {
-    clearTimeout(auditAckTimer);
-    setAuditStatus(data.message || '保存確認中です。アプリ画面に戻って確認してください', false);
+    setAuditProgressStatus('保存結果を確認しています。そのままお待ちください。');
+    scheduleAuditWaitNotices();
     return;
   }
-  clearTimeout(auditAckTimer);
+  if (data.phase !== 'FINAL') return;
+  clearAuditWaitTimers();
   auditWaitingAck = false;
   var normal = data.ok && ['CONFIRMED', 'DUPLICATE_SAME_LOCATION', 'MANUAL_IDENTIFIED'].indexOf(data.result) !== -1;
   if (navigator.vibrate) navigator.vibrate(normal ? [80, 60, 80] : [180]);
@@ -245,6 +299,14 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
     });
 });
 document.getElementById('auditResumeBtn').addEventListener('click', function () {
+  if (auditResumeAction === 'check-app') {
+    pageLeaving = true;
+    clearAuditWaitTimers();
+    stopCamera();
+    window.close();
+    return;
+  }
+  clearAuditWaitTimers();
   auditWaitingAck = false;
   detected = false;
   lastSentQr = '';
@@ -254,11 +316,13 @@ document.getElementById('auditResumeBtn').addEventListener('click', function () 
 });
 document.getElementById('auditCloseBtn').addEventListener('click', function () {
   pageLeaving = true;
+  clearAuditWaitTimers();
   stopCamera();
   window.close();
 });
 window.addEventListener('pagehide', function () {
   pageLeaving = true;
+  clearAuditWaitTimers();
   stopCamera();
 });
 </script>
