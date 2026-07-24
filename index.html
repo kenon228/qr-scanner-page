@@ -68,15 +68,31 @@ var auditSessionId = query.get('sessionId') || '';
 var auditWaitingAck = false;
 var auditAckTimer = null;
 var auditLongWaitTimer = null;
+var auditSessionWarningTimer = null;
+var auditSessionEndTimer = null;
+var auditSessionDeadline = 0;
+var auditSessionWarningActive = false;
+var auditSessionEnding = false;
+var auditDetectedCount = 0;
 var auditMessageId = '';
+var auditOperationId = '';
 var auditDetectedAtEpochMs = 0;
 var auditResumeAction = 'resume';
 var lastSentQr = '';
 var blankSince = 0;
+var auditId = query.get('auditId') || '';
+var auditLocationKey = query.get('locationKey') || '';
+var auditObservedLocationId = query.get('observedLocationId') || '';
+var AUDIT_SESSION_WARNING_MS = 50000;
+var AUDIT_SESSION_LIMIT_MS = 60000;
+var AUDIT_SCANNER_PENDING_PREFIX = 'inventoryAudit.scannerPending.v1.';
 
 function hasValidLaunchParameters() {
   if (!/^[a-f0-9]{32}$/.test(scanNonce)) return false;
   if (scanMode === 'audit' && !/^[a-f0-9]{32}$/.test(auditSessionId)) return false;
+  if (scanMode === 'audit' && !/^AUD-[A-Z0-9]{16}$/.test(auditId)) return false;
+  if (scanMode === 'audit' && (!auditLocationKey || auditLocationKey.length > 200)) return false;
+  if (scanMode === 'audit' && (!auditObservedLocationId || auditObservedLocationId.length > 200)) return false;
   try {
     var parsed = new URL(openerOrigin);
     return parsed.protocol === 'https:' && parsed.origin === openerOrigin;
@@ -108,7 +124,9 @@ function setAuditStatus(message, canResume, resumeAction) {
 
 function setAuditProgressStatus(message) {
   document.getElementById('auditBox').style.display = 'block';
-  document.getElementById('auditStatus').textContent = auditResumeAction === 'check-app'
+  document.getElementById('auditStatus').textContent = auditSessionWarningActive
+    ? 'まもなく保存確認画面へ戻ります。新しいQRは読み取りません。'
+    : auditResumeAction === 'check-app'
     ? '保存確認を続けています。必要ならアプリで確認してください。'
     : message;
 }
@@ -126,6 +144,62 @@ function clearAuditWaitTimers() {
   clearTimeout(auditLongWaitTimer);
   auditAckTimer = null;
   auditLongWaitTimer = null;
+}
+
+function clearAuditSessionTimers() {
+  clearTimeout(auditSessionWarningTimer);
+  clearTimeout(auditSessionEndTimer);
+  auditSessionWarningTimer = null;
+  auditSessionEndTimer = null;
+}
+
+function newAuditOperationId() {
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.prototype.map.call(bytes, function (value) {
+    return ('0' + value.toString(16)).slice(-2);
+  }).join('');
+}
+
+function auditScannerPendingKey(operationId) {
+  return AUDIT_SCANNER_PENDING_PREFIX + operationId;
+}
+
+function listAuditScannerPending() {
+  var records = [];
+  for (var i = 0; i < localStorage.length; i++) {
+    var key = localStorage.key(i) || '';
+    if (key.indexOf(AUDIT_SCANNER_PENDING_PREFIX) !== 0) continue;
+    var record = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!record || record.schemaVersion !== 1 ||
+        !/^[a-f0-9]{32}$/.test(record.operationId || '') ||
+        typeof record.qrId !== 'string' || !record.qrId || record.qrId.length > 100 ||
+        !/^AUD-[A-Z0-9]{16}$/.test(record.auditId || '') ||
+        typeof record.locationKey !== 'string' || !record.locationKey ||
+        record.locationKey.length > 200 ||
+        typeof record.observedLocationId !== 'string' || !record.observedLocationId ||
+        record.observedLocationId.length > 200) {
+      throw new Error('処理中QRの端末データが不正です');
+    }
+    if (key !== auditScannerPendingKey(record.operationId)) {
+      throw new Error('処理中QRの端末データが不正です');
+    }
+    records.push(record);
+  }
+  return records;
+}
+
+function persistAuditScannerPending(record) {
+  var key = auditScannerPendingKey(record.operationId);
+  localStorage.setItem(key, JSON.stringify(record));
+  var saved = JSON.parse(localStorage.getItem(key) || 'null');
+  if (!saved || saved.operationId !== record.operationId || saved.qrId !== record.qrId) {
+    throw new Error('処理中QRを端末へ保存できません');
+  }
+}
+
+function removeAuditScannerPending(operationId) {
+  try { localStorage.removeItem(auditScannerPendingKey(operationId)); } catch (ignore) {}
 }
 
 function scheduleAuditWaitNotices() {
@@ -148,6 +222,67 @@ function scheduleAuditWaitNotices() {
   }, Math.max(0, 180000 - elapsed));
 }
 
+function notifyAuditSessionEnded(reason) {
+  if (!window.opener || !hasValidLaunchParameters()) return;
+  try {
+    window.opener.postMessage({
+      type: 'audit-scanner-session-ended',
+      reason: reason,
+      nonce: scanNonce,
+      sessionId: auditSessionId,
+      detectedCount: auditDetectedCount
+    }, openerOrigin);
+  } catch (ignore) {}
+}
+
+function finishAuditTimedSession() {
+  if (scanMode !== 'audit' || auditSessionEnding) return;
+  auditSessionEnding = true;
+  pageLeaving = true;
+  auditSessionWarningActive = true;
+  detected = true;
+  clearAuditSessionTimers();
+  clearAuditWaitTimers();
+  stopCamera();
+  setAuditStatus('1分経過のため保存確認画面へ戻ります。', false);
+  notifyAuditSessionEnded('TIME_LIMIT');
+  // openerを先に前面化すると、このタブのcloseタイマーが停止し得るため先に閉じる。
+  window.close();
+  setTimeout(function () {
+    try { if (window.opener && !window.opener.closed) window.opener.focus(); } catch (ignore) {}
+    setTimeout(function () {
+      setAuditStatus('自動で戻れませんでした。アプリ側で保存結果を確認してください。', true, 'check-app');
+    }, 500);
+  }, 100);
+}
+
+function startAuditSessionClock() {
+  if (scanMode !== 'audit' || auditSessionDeadline) return;
+  auditSessionDeadline = Date.now() + AUDIT_SESSION_LIMIT_MS;
+  auditSessionWarningTimer = setTimeout(function () {
+    if (auditSessionEnding) return;
+    auditSessionWarningActive = true;
+    detected = true;
+    setAuditStatus('まもなく保存確認画面へ戻ります。新しいQRは読み取りません。', false);
+  }, AUDIT_SESSION_WARNING_MS);
+  auditSessionEndTimer = setTimeout(finishAuditTimedSession, AUDIT_SESSION_LIMIT_MS);
+}
+
+function enforceAuditSessionDeadline() {
+  if (scanMode === 'audit' && auditSessionDeadline && Date.now() >= auditSessionDeadline) {
+    finishAuditTimedSession();
+  }
+}
+
+function enforceAuditWarningDeadline() {
+  if (scanMode !== 'audit' || !auditSessionDeadline || auditSessionEnding) return false;
+  if (Date.now() < auditSessionDeadline - 10000) return false;
+  auditSessionWarningActive = true;
+  detected = true;
+  setAuditStatus('まもなく保存確認画面へ戻ります。新しいQRは読み取りません。', false);
+  return true;
+}
+
 function newMessageId() {
   var bytes = new Uint8Array(12);
   window.crypto.getRandomValues(bytes);
@@ -157,26 +292,85 @@ function newMessageId() {
 }
 
 function sendAuditCandidate(qrId) {
-  if (auditWaitingAck) return;
+  enforceAuditSessionDeadline();
+  if (auditWaitingAck || auditSessionWarningActive || auditSessionEnding ||
+      enforceAuditWarningDeadline()) return;
   if (isOpenerUnavailable()) {
     setAuditStatus('アプリ画面との接続を確認できません。アプリ側で保存結果を確認してください。', true, 'check-app');
     return;
   }
   if (!hasValidLaunchParameters()) return;
+  var normalizedQrId = String(qrId || '').trim().toUpperCase();
+  if (!normalizedQrId || normalizedQrId.length > 100) {
+    setAuditStatus('QR内容が空か長すぎるため読み取れません。', true, 'resume');
+    return;
+  }
+  var operationId = newAuditOperationId();
+  var messageId = newMessageId();
+  var detectedAt = Date.now();
+  try {
+    persistAuditScannerPending({
+      schemaVersion: 1,
+      operationId: operationId,
+      qrId: normalizedQrId,
+      auditId: auditId,
+      locationKey: auditLocationKey,
+      observedLocationId: auditObservedLocationId,
+      source: 'camera',
+      detectedAtEpochMs: detectedAt,
+      createdAtEpochMs: detectedAt
+    });
+  } catch (storageError) {
+    detected = true;
+    setAuditStatus('処理中QRを端末へ保存できないため、読み取りを停止しました。', true, 'check-app');
+    return;
+  }
   auditWaitingAck = true;
   detected = true;
-  lastSentQr = String(qrId || '').trim();
-  auditMessageId = newMessageId();
-  auditDetectedAtEpochMs = Date.now();
+  lastSentQr = normalizedQrId;
+  auditMessageId = messageId;
+  auditOperationId = operationId;
+  auditDetectedAtEpochMs = detectedAt;
+  auditDetectedCount++;
   if (navigator.vibrate) navigator.vibrate(25);
   setAuditStatus('QRを検出しました。保存中… ' + lastSentQr, false);
   window.opener.postMessage({
     type: 'audit-qr-candidate',
     qrId: lastSentQr,
     messageId: auditMessageId,
+    operationId: operationId,
     nonce: scanNonce,
     sessionId: auditSessionId,
-    detectedAtEpochMs: auditDetectedAtEpochMs
+    detectedAtEpochMs: auditDetectedAtEpochMs,
+    auditId: auditId,
+    locationKey: auditLocationKey,
+    observedLocationId: auditObservedLocationId,
+    source: 'camera'
+  }, openerOrigin);
+  scheduleAuditWaitNotices();
+}
+
+function resendStoredAuditCandidate(record) {
+  if (!record || auditWaitingAck || auditSessionEnding) return;
+  auditWaitingAck = true;
+  detected = true;
+  lastSentQr = record.qrId;
+  auditMessageId = newMessageId();
+  auditOperationId = record.operationId;
+  auditDetectedAtEpochMs = Number(record.detectedAtEpochMs) || Date.now();
+  setAuditStatus('前回の処理中QRを再確認しています… ' + lastSentQr, false);
+  window.opener.postMessage({
+    type: 'audit-qr-candidate',
+    qrId: record.qrId,
+    messageId: auditMessageId,
+    operationId: record.operationId,
+    nonce: scanNonce,
+    sessionId: auditSessionId,
+    detectedAtEpochMs: auditDetectedAtEpochMs,
+    auditId: record.auditId,
+    locationKey: record.locationKey,
+    observedLocationId: record.observedLocationId,
+    source: record.source || 'camera'
   }, openerOrigin);
   scheduleAuditWaitNotices();
 }
@@ -217,8 +411,17 @@ window.addEventListener('message', function (event) {
     return;
   }
   if (data.phase !== 'FINAL') return;
+  if (data.operationId !== auditOperationId) return;
   clearAuditWaitTimers();
+  var terminalResult = !!data.ok || data.result === 'FAILED';
+  if (terminalResult) removeAuditScannerPending(data.operationId);
   auditWaitingAck = false;
+  if (!terminalResult) {
+    detected = true;
+    setAuditStatus('未送信のQRを端末に保持しています。アプリ側で確認してください: ' +
+      (data.message || data.result || ''), true, 'check-app');
+    return;
+  }
   var normal = data.ok && ['CONFIRMED', 'DUPLICATE_SAME_LOCATION', 'MANUAL_IDENTIFIED'].indexOf(data.result) !== -1;
   if (navigator.vibrate) navigator.vibrate(normal ? [80, 60, 80] : [180]);
   setAuditStatus((normal ? '保存済み: ' : data.ok ? '要確認として記録: ' : '保存失敗: ') +
@@ -231,7 +434,9 @@ window.addEventListener('message', function (event) {
 });
 
 function tick(timestamp) {
-  if (detected || !activeStream) return;
+  enforceAuditSessionDeadline();
+  if (enforceAuditWarningDeadline() || detected || !activeStream ||
+      auditSessionWarningActive || auditSessionEnding) return;
   if (timestamp - lastAnalysisAt >= 120 && video.readyState === video.HAVE_ENOUGH_DATA) {
     lastAnalysisAt = timestamp;
     var analysisWidth = Math.min(800, video.videoWidth);
@@ -289,9 +494,39 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
       video.style.display = '';
       document.getElementById('frame').style.display = '';
       document.getElementById('scanMsg').style.display = '';
-      if (scanMode === 'audit') setAuditStatus('次のQRを読み取ってください', false);
+      if (scanMode === 'audit') {
+        setAuditStatus('連続スキャンは約1分ごとに保存確認のため終了します。', false);
+      }
       video.srcObject = stream;
-      requestAnimationFrame(tick);
+      video.onplaying = function () {
+        startAuditSessionClock();
+        if (scanMode !== 'audit') {
+          requestAnimationFrame(tick);
+          return;
+        }
+        var pendingRecords;
+        try {
+          pendingRecords = listAuditScannerPending();
+        } catch (storageError) {
+          stopCamera();
+          setAuditStatus('前回の処理中QRを端末から読み出せません。アプリで確認してください。', true, 'check-app');
+          return;
+        }
+        if (pendingRecords.length) {
+          var matching = pendingRecords.filter(function (record) {
+            return record.auditId === auditId && record.locationKey === auditLocationKey &&
+              record.observedLocationId === auditObservedLocationId;
+          });
+          if (matching.length !== pendingRecords.length || matching.length > 1) {
+            stopCamera();
+            setAuditStatus('別の場所または複数の処理中QRが端末に残っています。アプリで確認してください。', true, 'check-app');
+            return;
+          }
+          resendStoredAuditCandidate(matching[0]);
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
     })
     .catch(function (err) {
       starting = false;
@@ -309,6 +544,7 @@ document.getElementById('auditResumeBtn').addEventListener('click', function () 
   clearAuditWaitTimers();
   auditWaitingAck = false;
   detected = false;
+  auditOperationId = '';
   lastSentQr = '';
   blankSince = 0;
   setAuditStatus('次のQRを読み取ってください', false);
@@ -316,14 +552,31 @@ document.getElementById('auditResumeBtn').addEventListener('click', function () 
 });
 document.getElementById('auditCloseBtn').addEventListener('click', function () {
   pageLeaving = true;
+  notifyAuditSessionEnded('USER_CLOSE');
+  clearAuditSessionTimers();
   clearAuditWaitTimers();
   stopCamera();
   window.close();
 });
 window.addEventListener('pagehide', function () {
   pageLeaving = true;
+  clearAuditSessionTimers();
   clearAuditWaitTimers();
   stopCamera();
+});
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden) {
+    enforceAuditSessionDeadline();
+    enforceAuditWarningDeadline();
+  }
+});
+window.addEventListener('pageshow', function () {
+  enforceAuditSessionDeadline();
+  enforceAuditWarningDeadline();
+});
+window.addEventListener('focus', function () {
+  enforceAuditSessionDeadline();
+  enforceAuditWarningDeadline();
 });
 </script>
 </body>
