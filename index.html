@@ -61,6 +61,9 @@ var activeStream = null;
 var lastAnalysisAt = 0;
 var pageLeaving = false;
 var query = new URLSearchParams(window.location.search);
+var hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+var sameTabLaunchToken = hashParams.get('launch') || '';
+var sameTabLaunch = null;
 var scanNonce = query.get('nonce') || '';
 var openerOrigin = query.get('openerOrigin') || '';
 var scanMode = query.get('mode') || 'single';
@@ -86,8 +89,46 @@ var auditObservedLocationId = query.get('observedLocationId') || '';
 var AUDIT_SESSION_WARNING_MS = 50000;
 var AUDIT_SESSION_LIMIT_MS = 60000;
 var AUDIT_SCANNER_PENDING_PREFIX = 'inventoryAudit.scannerPending.v1.';
+var SINGLE_SCANNER_PENDING_PREFIX = 'qrHandoff.single.v1.';
+
+function decodeBase64UrlJson(value) {
+  var normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (normalized.length % 4) normalized += '=';
+  return JSON.parse(decodeURIComponent(Array.prototype.map.call(atob(normalized), function (c) {
+    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+  }).join('')));
+}
+
+function parseSameTabLaunch() {
+  if (!sameTabLaunchToken || !/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(sameTabLaunchToken)) return null;
+  try {
+    var parts = sameTabLaunchToken.split('.');
+    var payload = decodeBase64UrlJson(parts[1]);
+    if (!payload || payload.v !== 1 || !/^[a-z0-9]{32}$/.test(String(payload.requestId || '')) ||
+        !/^(intake|edit|dispose)$/.test(String(payload.mode || '')) ||
+        !/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(String(payload.returnUrl || '')) ||
+        Number(payload.expiresAt || 0) < Date.now()) return null;
+    if (/^[a-z0-9]{32}$/.test(String(payload.ackResultId || ''))) {
+      try { localStorage.removeItem(SINGLE_SCANNER_PENDING_PREFIX + payload.ackResultId); } catch (ignore) {}
+    }
+    return payload;
+  } catch (e) {
+    return null;
+  }
+}
+
+sameTabLaunch = parseSameTabLaunch();
+
+function newSingleResultId() {
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return Array.prototype.map.call(bytes, function (value) {
+    return ('0' + value.toString(16)).slice(-2);
+  }).join('');
+}
 
 function hasValidLaunchParameters() {
+  if (sameTabLaunch) return true;
   if (!/^[a-f0-9]{32}$/.test(scanNonce)) return false;
   if (scanMode === 'audit' && !/^[a-f0-9]{32}$/.test(auditSessionId)) return false;
   if (scanMode === 'audit' && !/^AUD-[A-Z0-9]{16}$/.test(auditId)) return false;
@@ -107,6 +148,29 @@ function sendResultAndClose(qrId) {
     return;
   }
   stopCamera();
+  if (sameTabLaunch) {
+    var resultId = newSingleResultId();
+    var handoff = {
+      schemaVersion: 1,
+      resultId: resultId,
+      token: sameTabLaunchToken,
+      qrId: String(qrId || '').trim().toUpperCase(),
+      createdAt: Date.now()
+    };
+    try {
+      localStorage.setItem(SINGLE_SCANNER_PENDING_PREFIX + resultId, JSON.stringify(handoff));
+      var saved = JSON.parse(localStorage.getItem(SINGLE_SCANNER_PENDING_PREFIX + resultId) || 'null');
+      if (!saved || saved.resultId !== resultId || saved.qrId !== handoff.qrId) throw new Error('保存確認失敗');
+    } catch (e) {
+      showError('読取り結果を安全に保存できませんでした。通常のブラウズモードで開き直してください。');
+      return;
+    }
+    document.getElementById('scanMsg').textContent = '読み取りました。アプリへ戻っています…';
+    var encoded = btoa(unescape(encodeURIComponent(JSON.stringify(handoff))))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    window.location.replace(sameTabLaunch.returnUrl + '#qrReturn=' + encoded);
+    return;
+  }
   if (window.opener && hasValidLaunchParameters()) {
     window.opener.postMessage({ type: 'qr-scanned', qrId: qrId, nonce: scanNonce }, openerOrigin);
   }
@@ -471,7 +535,7 @@ function tick(timestamp) {
 
 document.getElementById('startCameraBtn').addEventListener('click', function () {
   if (starting || activeStream) return;
-  if (!window.opener || !hasValidLaunchParameters()) {
+  if (!hasValidLaunchParameters() || (!sameTabLaunch && !window.opener)) {
     showError('試薬管理アプリからQRスキャンを開始してください');
     return;
   }
