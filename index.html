@@ -99,6 +99,17 @@ function decodeBase64UrlJson(value) {
   }).join('')));
 }
 
+function isProductionGasWebAppUrl(value) {
+  var workspaceDomain =
+    '[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?' +
+    '(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+';
+  var pattern = new RegExp(
+    '^https://script\\.google\\.com/(?:macros|a/macros/' + workspaceDomain +
+    ')/s/[A-Za-z0-9_-]+/exec(?![\\s\\S])'
+  );
+  return pattern.test(String(value || ''));
+}
+
 function parseSameTabLaunch() {
   if (!sameTabLaunchToken || !/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(sameTabLaunchToken)) return null;
   try {
@@ -106,7 +117,7 @@ function parseSameTabLaunch() {
     var payload = decodeBase64UrlJson(parts[1]);
     if (!payload || payload.v !== 1 || !/^[a-z0-9]{32}$/.test(String(payload.requestId || '')) ||
         !/^(intake|edit|dispose)$/.test(String(payload.mode || '')) ||
-        !/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(String(payload.returnUrl || '')) ||
+        !isProductionGasWebAppUrl(payload.returnUrl) ||
         Number(payload.expiresAt || 0) < Date.now()) return null;
     if (/^[a-z0-9]{32}$/.test(String(payload.ackResultId || ''))) {
       try { localStorage.removeItem(SINGLE_SCANNER_PENDING_PREFIX + payload.ackResultId); } catch (ignore) {}
