@@ -33,7 +33,7 @@
   </div>
   <div class="errorBox" id="errorBox">
     <div id="errorText">カメラを起動できませんでした</div>
-    <button onclick="window.close()">閉じる</button>
+    <button id="errorCloseBtn" type="button">閉じる</button>
   </div>
   <div class="auditBox" id="auditBox" role="status" aria-live="polite">
     <div id="auditStatus">棚卸し連続スキャン</div>
@@ -460,10 +460,29 @@ function showError(message) {
   stopCamera();
   document.getElementById('startBox').style.display = 'none';
   document.getElementById('errorText').textContent = message;
+  document.getElementById('errorCloseBtn').textContent =
+    sameTabLaunch ? '試薬管理へ戻る' :
+      (sameTabLaunchToken ? '前の画面へ戻る' : '閉じる');
   document.getElementById('errorBox').style.display = 'flex';
   if (window.opener && hasValidLaunchParameters()) {
     window.opener.postMessage({ type: 'qr-error', message: message, nonce: scanNonce }, openerOrigin);
   }
+}
+
+function leaveErrorScreen() {
+  pageLeaving = true;
+  clearAuditSessionTimers();
+  clearAuditWaitTimers();
+  stopCamera();
+  if (sameTabLaunch && isProductionGasWebAppUrl(sameTabLaunch.returnUrl)) {
+    window.location.replace(sameTabLaunch.returnUrl);
+    return;
+  }
+  if (sameTabLaunchToken) {
+    window.history.back();
+    return;
+  }
+  window.close();
 }
 
 window.addEventListener('message', function (event) {
@@ -608,6 +627,7 @@ document.getElementById('startCameraBtn').addEventListener('click', function () 
       showError('カメラを起動できませんでした: ' + (err && err.name ? err.name : 'Error'));
     });
 });
+document.getElementById('errorCloseBtn').addEventListener('click', leaveErrorScreen);
 document.getElementById('auditResumeBtn').addEventListener('click', function () {
   if (auditResumeAction === 'check-app') {
     pageLeaving = true;
